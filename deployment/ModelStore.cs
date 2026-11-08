@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
@@ -49,6 +50,40 @@ internal static class ModelStore
             if (IsGguf(path)) return path;
         }
         return null;
+    }
+
+    internal sealed record InstalledModel(string FileName, string Path, long Bytes);
+
+    // Every GGUF the user can switch to. Projections (mmproj) are part of a
+    // vision model rather than a model of their own, so they are not listed.
+    internal static InstalledModel[] Installed(string directory)
+    {
+        var folder = Path.Combine(directory, "models");
+        if (!Directory.Exists(folder)) return [];
+        var listed = new List<InstalledModel>();
+        foreach (var path in Directory.EnumerateFiles(folder, "*.gguf"))
+        {
+            if (Path.GetFileName(path).Contains("mmproj", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsGguf(path)) continue;
+            long bytes;
+            try { bytes = new FileInfo(path).Length; } catch { continue; }
+            listed.Add(new InstalledModel(Path.GetFileName(path), path, bytes));
+        }
+        return listed.OrderBy(m => m.FileName, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    internal static string? CurrentName(string directory) => Resolve(directory) is { } path ? Path.GetFileName(path) : null;
+
+    // Switches the model used by the next inference run without touching the
+    // files themselves; the caller restarts the runner to apply it.
+    internal static void Select(string directory, string fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName) || Path.GetFileName(fileName) != fileName)
+            throw new InvalidDataException("模型文件名无效。");
+        var path = Path.Combine(directory, "models", fileName);
+        if (!IsGguf(path)) throw new InvalidDataException("模型文件不可用：" + fileName);
+        var known = Sources.FirstOrDefault(s => s.FileName.Equals(fileName, StringComparison.OrdinalIgnoreCase));
+        Save(directory, new Selection(known?.Id ?? "manual", fileName, known?.Sha256));
     }
 
     internal static bool IsGguf(string path)

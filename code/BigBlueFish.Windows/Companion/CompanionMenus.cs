@@ -36,6 +36,14 @@ public partial class MainWindow
         test.Icon = Icon("\uE8F2");
         test.Click += async (_, _) => { companionContextMenu.IsOpen = false; await SpeakCompanionTest(); };
         companionContextMenu.Items.Add(test);
+        var chat = new MenuItem { Header = "和鱼鱼说话" };
+        chat.Icon = Icon("\uE8BD");
+        chat.Click += (_, _) =>
+        {
+            companionContextMenu.IsOpen = false;
+            if (!TryOpenMcpInput() && !brain.ModelAvailable) OpenModelInstaller();
+        };
+        companionContextMenu.Items.Add(chat);
         var hide = new MenuItem { Header = "隐藏桌宠" };
         hide.Icon = Icon("\uE8A7");
         hide.Click += (_, _) => { companionContextMenu.IsOpen = false; HideCompanion(); };

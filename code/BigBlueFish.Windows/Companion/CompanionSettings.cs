@@ -271,6 +271,68 @@ public partial class MainWindow
         };
         p.Children.Add(dwell);
         p = pages[2];
+        p.Children.Add(new TextBlock { Text = "本地模型（切换后立即生效）", Margin = new Thickness(0, 10, 0, 6) });
+        var modelPicker = new ComboBox { Margin = new Thickness(0, 0, 0, 6) };
+        System.Windows.Automation.AutomationProperties.SetName(modelPicker, "本地模型");
+        p.Children.Add(modelPicker);
+        var modelHint = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = Brushes.SlateGray, Margin = new Thickness(0, 0, 0, 8) };
+        p.Children.Add(modelHint);
+        var openModelsFolder = new Button { Content = "打开模型文件夹", Padding = new Thickness(8, 4, 8, 4), HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 0, 0, 8) };
+        openModelsFolder.Click += (_, _) =>
+        {
+            try
+            {
+                var folder = System.IO.Path.Combine(Environment.CurrentDirectory, "models");
+                System.IO.Directory.CreateDirectory(folder);
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(folder) { UseShellExecute = true });
+            }
+            catch (Exception error)
+            {
+                BigBlueFish.Deployment.ModernUI.Error(companionSettings, "未能打开模型文件夹", error);
+            }
+        };
+        p.Children.Add(openModelsFolder);
+        bool fillingModels = false;
+        string modelSignature = "";
+        BigBlueFish.Deployment.ModelStore.InstalledModel[] installedModels = [];
+        string ModelSignature()
+        {
+            var folder = System.IO.Path.Combine(Environment.CurrentDirectory, "models");
+            var names = System.IO.Directory.Exists(folder)
+                ? System.IO.Directory.GetFiles(folder, "*.gguf")
+                    .Where(p => !System.IO.Path.GetFileName(p).Contains("mmproj", StringComparison.OrdinalIgnoreCase))
+                    .Select(p => System.IO.Path.GetFileName(p) + ":" + new System.IO.FileInfo(p).Length)
+                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                : Enumerable.Empty<string>();
+            return string.Join("|", names) + "#" + (BigBlueFish.Deployment.ModelStore.CurrentName(Environment.CurrentDirectory) ?? "");
+        }
+        void FillModels()
+        {
+            var directory = Environment.CurrentDirectory;
+            installedModels = BigBlueFish.Deployment.ModelStore.Installed(directory);
+            modelSignature = ModelSignature();
+            fillingModels = true;
+            modelPicker.Items.Clear();
+            foreach (var model in installedModels)
+                modelPicker.Items.Add(model.FileName + " · " + FormatModelSize(model.Bytes));
+            var current = BigBlueFish.Deployment.ModelStore.CurrentName(directory);
+            modelPicker.SelectedIndex = Array.FindIndex(installedModels,
+                m => string.Equals(m.FileName, current, StringComparison.OrdinalIgnoreCase));
+            modelPicker.IsEnabled = installedModels.Length > 0;
+            fillingModels = false;
+            modelHint.Text = installedModels.Length == 0
+                ? "模型文件夹里还没有 GGUF 模型，可以先安装模型，或把文件放进模型文件夹。"
+                : "当前：" + (current ?? "未选择模型") + "。切换后会重新加载模型，正在说的一句话会中断。";
+        }
+        modelPicker.SelectionChanged += (_, _) =>
+        {
+            if (fillingModels || modelPicker.SelectedIndex < 0 || modelPicker.SelectedIndex >= installedModels.Length) return;
+            var chosen = installedModels[modelPicker.SelectedIndex].FileName;
+            if (string.Equals(chosen, BigBlueFish.Deployment.ModelStore.CurrentName(Environment.CurrentDirectory), StringComparison.OrdinalIgnoreCase)) return;
+            ApplyModelSelection(chosen);
+            FillModels();
+        };
+        FillModels();
         var installModel = new Button { Content = "安装模型", Margin = new Thickness(0, 8, 0, 8) };
         installModel.Click += (_, _) => OpenModelInstaller();
         p.Children.Add(installModel);
@@ -287,6 +349,9 @@ public partial class MainWindow
         };
         void UpdateStatus()
         {
+            // The model folder can change while settings stay open (installer, or
+            // files dropped in by hand), so keep the picker in step.
+            if (!modelPicker.IsDropDownOpen && ModelSignature() != modelSignature) FillModels();
             freq.IsEnabled = !PuppetActive;
             frequencyHint.Text = PuppetActive ? "日常关心的触发时机已交给 Agent，此时说话间隔不可调节。关闭接管触发后恢复使用此设置。"
                 : AgentDailyActive ? "鱼鱼仍按此间隔触发日常关心，由 Agent 编写吐字。" : "鱼鱼按此间隔触发日常关心，由本地模型编写吐字。";
@@ -342,6 +407,27 @@ public partial class MainWindow
             if (companionSettings != w || w.Content != shell) return;
             for (int i = 0; i < views.Length; i++) views[i].ScrollToVerticalOffset(scrollOffsets[i]);
         }));
+    }
+
+    private static string FormatModelSize(long bytes) => bytes >= 1L << 30
+        ? $"{bytes / (double)(1L << 30):0.0} GB" : $"{Math.Max(1, bytes / (1L << 20))} MB";
+
+    // Applies a model chosen in settings and restarts the runner so the next
+    // request loads it. Nothing else about the pet's state is touched.
+    private void ApplyModelSelection(string fileName)
+    {
+        try { BigBlueFish.Deployment.ModelStore.Select(Environment.CurrentDirectory, fileName); }
+        catch (Exception error)
+        {
+            BigBlueFish.Deployment.ModernUI.Error(companionSettings, "无法切换模型", error);
+            return;
+        }
+        InvalidateSpeechRequests(true);
+        brain.ReloadModel();
+        nextWarmup = DateTime.MinValue;
+        nextSpeech = DateTime.UtcNow.AddSeconds(6);
+        if (preferences.ModelEnabled && brain.ModelAvailable && brain.CanRunOnCurrentPower)
+            _ = brain.WarmUp();
     }
 
     private void ActivateCompanionSettings(Window window)

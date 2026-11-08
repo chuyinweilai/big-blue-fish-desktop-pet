@@ -68,9 +68,15 @@ internal sealed class CompanionBrain : IDisposable
     internal bool VisionAvailable => false;
     internal const string InputMode = "OCR";
 #else
-    internal bool VisionAvailable => File.Exists(Path.GetFullPath("models/Qwen3.5-4B-heretic.mmproj-f16.gguf"));
+    internal const string VisionProjection = "models/Qwen3.5-4B-heretic.mmproj-f16.gguf";
+    // The projection only matches the model it was converted from, so it is
+    // attached only while that model is the selected one.
+    internal bool VisionAvailable => ModelFileName is { } name
+        && name.Contains("heretic", StringComparison.OrdinalIgnoreCase)
+        && File.Exists(Path.GetFullPath(VisionProjection));
     internal const string InputMode = "Vision";
 #endif
+    internal string? ModelFileName => BigBlueFish.Deployment.ModelStore.CurrentName(Environment.CurrentDirectory);
     internal int? RunnerPid => runner is { HasExited: false } ? runner.Id : null;
     // Temporary experiment: show streamed model output as it arrives.
     internal static bool StreamingResponses { get; set; } = true;
@@ -458,8 +464,29 @@ internal sealed class CompanionBrain : IDisposable
     }
 
     private async Task<string> CompleteRequest(string persona, string request, double temperature, CancellationToken token, CompanionWindowImage? image = null, Action<string>? onPartial = null)
+        => await CompleteMessages(BuildMessages(persona, request, image),
+            persona == NewsPersona ? 160 : persona == WeatherPersona ? 220 : 180, temperature, token, Clean, onPartial);
+
+    // Chat replies are meant to be read as a short answer, so they keep a wider
+    // length budget than a single reaction line.
+    internal static string CleanChat(string text)
     {
-        var messages = BuildMessages(persona, request, image);
+        text = Regex.Replace(text, @"<think>[\s\S]*?</think>", "", RegexOptions.IgnoreCase);
+        if (text.Contains("<think>", StringComparison.OrdinalIgnoreCase))
+            return "";
+        text = Regex.Replace(text.Trim().Trim('"', '“', '”'), @"[ \t]+", " ").Trim();
+        if (!Regex.IsMatch(text, @"[\p{L}\p{N}]") || Regex.IsMatch(text, @"(.)\1{8}"))
+            return "";
+        var runes = text.EnumerateRunes().ToArray();
+        if (runes.Length <= 320) return text;
+        var clipped = string.Concat(runes.Take(318).Select(x => x.ToString()));
+        var end = clipped.LastIndexOfAny(['。', '！', '？', '～', '\n']);
+        return end >= 40 ? clipped[..(end + 1)] : clipped + "…";
+    }
+
+    private async Task<string> CompleteMessages(IReadOnlyList<ChatMessage> messages, int maxTokens, double temperature,
+        CancellationToken token, Func<string, string> clean, Action<string>? onPartial = null)
+    {
         LastTimings = null;
         var payload = new
         {
@@ -467,7 +494,7 @@ internal sealed class CompanionBrain : IDisposable
             messages,
             temperature,
             top_p = .9,
-            max_tokens = persona == NewsPersona ? 160 : persona == WeatherPersona ? 220 : 180,
+            max_tokens = maxTokens,
             stream = StreamingResponses,
             cache_prompt = true,
             stream_options = new { include_usage = true },
@@ -488,7 +515,7 @@ internal sealed class CompanionBrain : IDisposable
         {
             using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
             if (document.RootElement.TryGetProperty("timings", out var timings)) LastTimings = timings.Clone();
-            return Clean(document.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "");
+            return clean(document.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "");
         }
 
         using var reader = new StreamReader(await response.Content.ReadAsStreamAsync(token));
@@ -516,7 +543,7 @@ internal sealed class CompanionBrain : IDisposable
                 if (piece.Length == 0)
                     continue;
                 raw.Append(piece);
-                var partial = Clean(raw.ToString());
+                var partial = clean(raw.ToString());
                 if (partial.Length > 0 && partial != lastPartial)
                 {
                     lastPartial = partial;
@@ -528,7 +555,55 @@ internal sealed class CompanionBrain : IDisposable
             }
         }
 
-        return Clean(raw.ToString());
+        return clean(raw.ToString());
+    }
+
+    // A short chat turn with the local model. Only the caller's bounded history
+    // is kept in memory; nothing is written to disk.
+    internal async Task<string> Chat(IReadOnlyList<ChatMessage> messages, Action<string>? onPartial = null, CancellationToken external = default)
+    {
+        if (disposed || Busy || messages.Count == 0 || !CanRunOnCurrentPower) return "";
+        Busy = true;
+        active = CancellationTokenSource.CreateLinkedTokenSource(external);
+        active.CancelAfter(TimeSpan.FromSeconds(120));
+        var token = active.Token;
+        try
+        {
+            Status = "正在加载本地模型";
+            await EnsureRunner(token);
+            Status = "正在陪主人聊天";
+            var text = await CompleteMessages(messages, 320, .7, token, CleanChat, onPartial);
+            Status = ReadyStatus("本地模型就绪");
+            return CanRunOnCurrentPower ? text : "";
+        }
+        catch (OperationCanceledException)
+        {
+            Status = RunnerPid == null ? "模型已停止" : ReadyStatus("已取消这次聊天");
+            return "";
+        }
+        catch (Exception e)
+        {
+            StopRunner(); RecordFailure("聊天", e);
+            Status = e is IOException ? e.Message : "暂时无法聊天，稍后重试";
+            return "";
+        }
+        finally
+        {
+            Busy = false;
+            active?.Dispose();
+            active = null;
+            if (!CanRunOnCurrentPower) StopRunner();
+        }
+    }
+
+    // Applies a model chosen in settings: the runner is stopped so the next
+    // request loads the new file.
+    internal void ReloadModel()
+    {
+        Stop();
+        nextModelCheck = DateTime.MinValue;
+        modelAvailable = BigBlueFish.Deployment.ModelStore.Resolve(Environment.CurrentDirectory) != null;
+        Status = modelAvailable ? "已切换本地模型，等待加载" : "尚未安装可用模型";
     }
 
     private async Task<CompanionNews.Item?> NewsItem(CancellationToken token)

@@ -378,7 +378,7 @@ public partial class MainWindow
         e.Handled = true;
         CompanionNative.GetCursorPos(out var clickPosition);
         var clickNow = DateTime.UtcNow;
-        bool doubleClick = McpInputAvailable && (clickNow - lastClickAt).TotalMilliseconds <= Forms.SystemInformation.DoubleClickTime
+        bool doubleClick = ChatInputAvailable && (clickNow - lastClickAt).TotalMilliseconds <= Forms.SystemInformation.DoubleClickTime
             && Math.Abs(clickPosition.X - lastClickPoint.X) <= Forms.SystemInformation.DoubleClickSize.Width
             && Math.Abs(clickPosition.Y - lastClickPoint.Y) <= Forms.SystemInformation.DoubleClickSize.Height;
         if (doubleClick && TryOpenMcpInput()) {
@@ -434,7 +434,7 @@ public partial class MainWindow
             PublishMcpInteraction("click", new { button = "left", Left, Top });
             CompanionNative.GetCursorPos(out var point);
             lastClickAt = DateTime.UtcNow; lastClickPoint = new Point(point.X, point.Y);
-            if (McpInputAvailable)
+            if (ChatInputAvailable)
             {
                 singleClickTimer?.Stop();
                 singleClickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(Forms.SystemInformation.DoubleClickTime) };
