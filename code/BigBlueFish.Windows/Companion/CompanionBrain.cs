@@ -416,6 +416,7 @@ internal sealed class CompanionBrain : IDisposable
 
     private string WeatherContext() => weather.CachedContext(WeatherRegionCode);
     internal Task<string> GetWeatherContext(CancellationToken token) => weather.Context(WeatherRegionCode, token);
+    internal Task<string> GetWeatherForecast(int days, CancellationToken token) => weather.ForecastBriefing(WeatherRegionCode, days, token);
 
     internal async Task<string> GenerateWeather(Action<string>? onPartial = null)
     {
@@ -560,7 +561,7 @@ internal sealed class CompanionBrain : IDisposable
 
     // A short chat turn with the local model. Only the caller's bounded history
     // is kept in memory; nothing is written to disk.
-    internal async Task<string> Chat(IReadOnlyList<ChatMessage> messages, Action<string>? onPartial = null, CancellationToken external = default)
+    internal async Task<string> Chat(IReadOnlyList<ChatMessage> messages, Action<string>? onPartial = null, CancellationToken external = default, int maxTokens = 320)
     {
         if (disposed || Busy || messages.Count == 0 || !CanRunOnCurrentPower) return "";
         Busy = true;
@@ -572,7 +573,7 @@ internal sealed class CompanionBrain : IDisposable
             Status = "正在加载本地模型";
             await EnsureRunner(token);
             Status = "正在陪主人聊天";
-            var text = await CompleteMessages(messages, 320, .7, token, CleanChat, onPartial);
+            var text = await CompleteMessages(messages, maxTokens, .7, token, CleanChat, onPartial);
             Status = ReadyStatus("本地模型就绪");
             return CanRunOnCurrentPower ? text : "";
         }

@@ -17,6 +17,7 @@ internal sealed class CompanionWeather : IDisposable
     private readonly object sync = new();
     private readonly CancellationTokenSource lifetime = new();
     private readonly Dictionary<string, Entry> entries = new();
+    private readonly Dictionary<string, (DateTimeOffset At, string Text)> briefings = new();
     private readonly Dictionary<string, DateTimeOffset> attempts = new();
     private readonly Dictionary<string, Task> pending = new();
     internal sealed record Entry(string Code, DateTimeOffset FetchedAt, DateTimeOffset ObservedAt, string Context);
@@ -97,6 +98,83 @@ internal sealed class CompanionWeather : IDisposable
         + "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
         + "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
         + "&forecast_days=1&timezone=Asia%2FShanghai";
+
+    // Multi-day briefing used when the owner asks about a specific day: it adds
+    // sunshine hours, cloud cover, UV and rain totals so replies can quote numbers.
+    internal static string BriefingUrl(CompanionRegion region, int days) =>
+        "https://api.open-meteo.com/v1/forecast?latitude=" + region.Latitude!.Value.ToString(CultureInfo.InvariantCulture)
+        + "&longitude=" + region.Longitude!.Value.ToString(CultureInfo.InvariantCulture)
+        + "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
+        + "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum"
+        + ",daylight_duration,cloud_cover_mean,uv_index_max,wind_speed_10m_max,sunrise,sunset"
+        + "&forecast_days=" + days.ToString(CultureInfo.InvariantCulture) + "&timezone=Asia%2FShanghai";
+
+    internal async Task<string> ForecastBriefing(string regionCode, int days, CancellationToken token)
+    {
+        var region = CompanionRegions.District(regionCode);
+        if (region.Latitude == null || region.Longitude == null) throw new IOException("所选地点缺少坐标，无法查询天气。");
+        days = Math.Clamp(days, 1, 7);
+        var key = region.Code + ":" + days.ToString(CultureInfo.InvariantCulture);
+        lock (sync)
+            if (briefings.TryGetValue(key, out var hit) && clock() - hit.At <= TimeSpan.FromMinutes(30) && hit.Text.Length > 0)
+                return hit.Text;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
+        deadline.CancelAfter(TimeSpan.FromSeconds(12));
+        using var response = await web.GetAsync(BriefingUrl(region, days), deadline.Token);
+        response.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(deadline.Token));
+        var text = FormatBriefing(region, json.RootElement);
+        lock (sync) briefings[key] = (clock(), text);
+        return text;
+    }
+
+    internal static string FormatBriefing(CompanionRegion region, JsonElement root)
+    {
+        var current = root.GetProperty("current");
+        var daily = root.GetProperty("daily");
+        string Number(JsonElement value) => value.GetDouble().ToString("0.#", CultureInfo.InvariantCulture);
+        string? Text(JsonElement array, int index) =>
+            array.ValueKind == JsonValueKind.Array && index < array.GetArrayLength() && array[index].ValueKind == JsonValueKind.String
+                ? array[index].GetString() : null;
+        double? Hours(JsonElement array, int index) =>
+            array.ValueKind == JsonValueKind.Array && index < array.GetArrayLength() && array[index].ValueKind == JsonValueKind.Number
+                ? Math.Round(array[index].GetDouble() / 3600, 1) : null;
+        double? Value(JsonElement array, int index) =>
+            array.ValueKind == JsonValueKind.Array && index < array.GetArrayLength() && array[index].ValueKind == JsonValueKind.Number
+                ? array[index].GetDouble() : null;
+
+        var lines = new List<string>
+        {
+            $"地点：{CompanionRegions.FullName(region)}。查询时间：{current.GetProperty("time").GetString()}（北京时间）。"
+            + $"此刻{Description(current.GetProperty("weather_code").GetInt32())}，气温{Number(current.GetProperty("temperature_2m"))}℃，"
+            + $"体感{Number(current.GetProperty("apparent_temperature"))}℃，湿度{Number(current.GetProperty("relative_humidity_2m"))}%，"
+            + $"风速{Number(current.GetProperty("wind_speed_10m"))}公里/小时。"
+        };
+        var names = new[] { "今天", "明天", "后天" };
+        var dates = daily.GetProperty("time");
+        var count = Math.Min(dates.GetArrayLength(), 3);
+        for (int i = 0; i < count; i++)
+        {
+            var label = i < names.Length ? names[i] : ("第" + (i + 1) + "天");
+            var parts = new List<string>
+            {
+                $"{label}（{dates[i].GetString()}）：{Description(daily.GetProperty("weather_code")[i].GetInt32())}",
+                $"最低{Number(daily.GetProperty("temperature_2m_min")[i])}℃、最高{Number(daily.GetProperty("temperature_2m_max")[i])}℃",
+                $"降水概率{Number(daily.GetProperty("precipitation_probability_max")[i])}%、降水量{Number(daily.GetProperty("precipitation_sum")[i])}毫米"
+            };
+            // Sunshine itself is not published for this grid, and the provider's
+            // sunshine_duration just repeats daylight length, so daylight hours
+            // plus mean cloud cover are the honest way to describe the sun.
+            if (Hours(daily.GetProperty("daylight_duration"), i) is { } daylight) parts.Add($"白天{daylight.ToString("0.#", CultureInfo.InvariantCulture)}小时");
+            if (Value(daily.GetProperty("cloud_cover_mean"), i) is { } cloud) parts.Add($"平均云量{cloud.ToString("0", CultureInfo.InvariantCulture)}%");
+            if (Value(daily.GetProperty("uv_index_max"), i) is { } uv) parts.Add($"紫外线指数最高{uv.ToString("0.#", CultureInfo.InvariantCulture)}");
+            if (Value(daily.GetProperty("wind_speed_10m_max"), i) is { } wind) parts.Add($"最大风速{wind.ToString("0.#", CultureInfo.InvariantCulture)}公里/小时");
+            if (Text(daily.GetProperty("sunrise"), i) is { } sunrise && Text(daily.GetProperty("sunset"), i) is { } sunset)
+                parts.Add($"日出{sunrise[^5..]}、日落{sunset[^5..]}");
+            lines.Add(string.Join("，", parts) + "。");
+        }
+        return string.Join("\n", lines);
+    }
 
     private async Task Fetch(CompanionRegion region)
     {

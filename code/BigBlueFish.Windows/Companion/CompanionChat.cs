@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -17,6 +18,7 @@ public partial class MainWindow
     private const int ChatHistoryEntries = 6;
     private const int ChatHistoryChars = 800;
     private readonly List<(bool FromUser, string Text)> chatHistory = new();
+    private readonly CompanionWebSearch webSearch = new();
     private bool localChatPending;
     private Window? mcpInput;
 
@@ -145,7 +147,7 @@ public partial class MainWindow
         return "鱼鱼正在忙着说别的话，稍等一下";
     }
 
-    private CompanionBrain.ChatMessage[] ChatMessages(string prompt)
+    private CompanionBrain.ChatMessage[] ChatMessages(string prompt, string persona, string? data = null)
     {
         var selected = new List<(bool FromUser, string Text)>();
         int budget = ChatHistoryChars;
@@ -157,19 +159,32 @@ public partial class MainWindow
             selected.Insert(0, entry);
             if (selected.Count >= ChatHistoryEntries) break;
         }
-        var messages = new List<CompanionBrain.ChatMessage> { new("system", CompanionDialogue.ChatPersona) };
+        var messages = new List<CompanionBrain.ChatMessage> { new("system", persona) };
         foreach (var entry in selected) messages.Add(new(entry.FromUser ? "user" : "assistant", entry.Text));
-        messages.Add(new("user", prompt));
+        messages.Add(new("user", data == null ? prompt : "【查到的资料】\n" + data + "\n\n【主人问】" + prompt));
         return messages.ToArray();
     }
+
+    private static readonly System.Text.RegularExpressions.Regex WeatherAsk = new(
+        @"天气|气温|温度|几度|下雨|下雪|雨伞|带伞|日照|晴天|多云|阴天|紫外线|风力|冷不冷|热不热|穿什么",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    private static readonly System.Text.RegularExpressions.Regex SearchAsk = new(
+        @"搜索|搜一下|搜搜|搜下|查一下|查查|帮我查|上网查|网上|最新|新闻|热点|实时|股价|汇率|行情|发布|上映|比分",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     private async Task SendLocalChatAsync(string prompt)
     {
         if (localChatPending || companionClosed || exitAnimation || !LocalChatAvailable) return;
+        // Opening a whitelisted app needs no model at all.
+        if (CompanionApps.TryLaunch(prompt, out var launched))
+        {
+            chatHistory.Add((true, prompt));
+            chatHistory.Add((false, launched));
+            while (chatHistory.Count > ChatHistoryEntries) chatHistory.RemoveAt(0);
+            ShowCompanionBubble(launched, true);
+            return;
+        }
         localChatPending = true;
-        var messages = ChatMessages(prompt);
-        chatHistory.Add((true, prompt));
-        while (chatHistory.Count > ChatHistoryEntries) chatHistory.RemoveAt(0);
         try
         {
             // Give an in-flight warm-up or utterance the same window manual
@@ -183,6 +198,39 @@ public partial class MainWindow
                 ShowCompanionNotice("主人，鱼鱼还在忙着别的事，等一下再跟我说吧～", true, true);
                 return;
             }
+            var persona = CompanionDialogue.ChatPersona;
+            string? data = null;
+            bool weatherAsk = WeatherAsk.IsMatch(prompt);
+            bool searchAsk = !weatherAsk && SearchAsk.IsMatch(prompt);
+            if (weatherAsk || searchAsk)
+            {
+                ShowCompanionNotice(weatherAsk ? "鱼鱼去查一下天气，稍等诶～" : "鱼鱼去网上搜一搜，稍等诶～", true);
+                try
+                {
+                    using var lookup = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                    if (weatherAsk)
+                    {
+                        // "后天" needs three days; "明天" needs today plus tomorrow.
+                        data = await brain.GetWeatherForecast(prompt.Contains("后天") ? 3 : 2, lookup.Token);
+                        persona = CompanionDialogue.ChatDataPersona;
+                    }
+                    else
+                    {
+                        data = await webSearch.Search(CompanionWebSearch.QueryFrom(prompt), lookup.Token);
+                        if (data.Length > 0) persona = CompanionDialogue.ChatSearchPersona;
+                        else data = null;
+                    }
+                }
+                catch (Exception)
+                {
+                    data = null;
+                }
+                if (data == null)
+                    ShowCompanionNotice(weatherAsk ? "唔……天气资料没查到，鱼鱼先凭印象说一句～" : "唔……鱼鱼没能连上网络，先随口答一句～", true);
+            }
+            var messages = ChatMessages(prompt, persona, data);
+            chatHistory.Add((true, prompt));
+            while (chatHistory.Count > ChatHistoryEntries) chatHistory.RemoveAt(0);
             InvalidateSpeechRequests();
             var version = speechRequestVersion;
             bool streamed = false;
@@ -194,7 +242,7 @@ public partial class MainWindow
                 {
                     streamed = true;
                     ShowCompanionPartial(partial, version, true);
-                });
+                }, default, data == null ? 320 : 420);
             }
             finally
             {
